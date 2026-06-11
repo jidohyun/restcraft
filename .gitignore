@@ -1,3 +1,7 @@
 target/
 .DS_Store
 .omc/
+
+# Zed dev extension build artifacts
+extension.wasm
+grammars/
