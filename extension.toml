@@ -1,0 +1,15 @@
+id = "restcraft"
+name = "RestCraft"
+version = "0.1.0"
+schema_version = 1
+authors = ["Jidohyun <tech@dnp.im>"]
+description = "REST Client for Zed — send HTTP requests directly from .http files"
+repository = "https://github.com/dnp-jidohyun/restcraft"
+
+[language_servers.restcraft-lsp]
+name = "RestCraft LSP"
+languages = ["HTTP"]
+
+[grammars.http]
+repository = "https://github.com/rest-nvim/tree-sitter-http"
+rev = "db8b4398de90b6d0b6c780aba96aaa2cd8e9202c"

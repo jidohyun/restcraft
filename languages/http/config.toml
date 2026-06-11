@@ -1,0 +1,6 @@
+name = "HTTP"
+grammar = "http"
+path_suffixes = ["http", "rest"]
+line_comments = ["# ", "// "]
+# Ported from vscode-restclient package.json "firstLine".
+first_line_pattern = '^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE|LOCK|UNLOCK|PROPFIND|PROPPATCH|COPY|MOVE|MKCOL|MKCALENDAR|ACL|SEARCH)\s+(.*?)HTTP/[0-9\.]+$'
