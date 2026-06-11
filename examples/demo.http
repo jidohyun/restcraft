@@ -1,0 +1,8 @@
+### 로컬 테스트 서버 루트
+GET {{base}}/
+
+### JSON 응답 (httpbin 스타일 echo)
+# @name echo
+GET {{base}}/demo.json
+X-Trace-Id: {{$guid}}
+X-Requested-At: {{$datetime iso8601}}
