@@ -12,12 +12,29 @@ pub const ENV_FILE_NAME: &str = "http-client.env.json";
 pub const SHARED_ENV_KEY: &str = "$shared";
 
 /// `~/.restcraft/` — environment selection and cookie jar live here.
+/// The cookie jar holds live session tokens, so the dir is created 0700.
 pub fn restcraft_home() -> PathBuf {
     let dir = dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(".restcraft");
-    let _ = std::fs::create_dir_all(&dir); // create on demand, best effort
+    let _ = create_private_dir(&dir); // create on demand, best effort
     dir
+}
+
+/// `create_dir_all` that makes newly created directories owner-only on unix.
+/// Pre-existing directories are left untouched.
+#[cfg(unix)]
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 /// Raw `http-client.env.json`: env name -> (variable name -> value).

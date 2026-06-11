@@ -82,7 +82,7 @@ pub fn save_cookie_jar(jar: &CookieStoreMutex) -> anyhow::Result<()> {
 
 fn save_cookie_jar_to(jar: &CookieStoreMutex, path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::settings::create_private_dir(parent)?;
     }
     let mut buf = Vec::new();
     {
@@ -96,8 +96,41 @@ fn save_cookie_jar_to(jar: &CookieStoreMutex, path: &Path) -> anyhow::Result<()>
             .save_incl_expired_and_nonpersistent_json(&mut buf)
             .map_err(|e| anyhow!("failed to serialize cookie jar: {e}"))?;
     }
-    fs::write(path, buf).map_err(|e| anyhow!("failed to write {}: {e}", path.display()))?;
-    Ok(())
+    // The jar holds live session/auth tokens: write owner-only (0600) via a
+    // same-dir temp file + rename so the jar is never observable as a
+    // world-readable or torn file. The rename also re-tightens any legacy
+    // 0644 cookies.json left by older builds.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let written = write_private_file(&tmp, &buf)
+        .and_then(|()| fs::rename(&tmp, path))
+        .map_err(|e| anyhow!("failed to write {}: {e}", path.display()));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp); // best-effort cleanup of the temp file
+    }
+    written
+}
+
+/// Creates/truncates `path` with mode 0600 on unix, then writes `buf`.
+/// The explicit `set_permissions` makes the mode exact even under a
+/// permissive umask or when the temp file survived a previous crash.
+#[cfg(unix)]
+fn write_private_file(path: &Path, buf: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(buf)?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, buf: &[u8]) -> std::io::Result<()> {
+    fs::write(path, buf)
 }
 
 /// Normalizes the three `Authorization: Basic` shorthands accepted by
@@ -438,6 +471,37 @@ mod tests {
         let store = reloaded.lock().unwrap();
         let cookie = store.get("example.com", "/", "sessionid").unwrap();
         assert_eq!(cookie.value(), "abc123");
+    }
+
+    /// Security: the jar holds session tokens, so the saved file must be
+    /// owner-only (0600), a freshly created parent dir 0700, an existing
+    /// world-readable jar re-tightened on save, and no temp file left behind.
+    #[cfg(unix)]
+    #[test]
+    fn cookie_jar_saved_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join("restcraft-test-jar-perms");
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("cookies.json");
+
+        let jar = load_cookie_jar_from(&path).unwrap();
+        let url: reqwest::Url = "https://example.com/".parse().unwrap();
+        jar.lock().unwrap().parse("sessionid=abc123", &url).unwrap();
+        save_cookie_jar_to(&jar, &path).unwrap();
+
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "cookie jar must not be world-readable");
+        assert_eq!(mode(&dir), 0o700, "created jar dir must be owner-only");
+        assert!(
+            !path.with_extension(format!("tmp.{}", std::process::id())).exists(),
+            "temp file must be renamed away"
+        );
+
+        // A legacy world-readable jar gets re-tightened by the next save.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        save_cookie_jar_to(&jar, &path).unwrap();
+        assert_eq!(mode(&path), 0o600, "legacy 0644 jar must be re-tightened");
     }
 
     #[test]
