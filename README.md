@@ -61,8 +61,8 @@ Content-Type: application/json
 RestCraft is not yet listed in the Zed extension registry — until it is,
 install it as a **dev extension**:
 
-1. Clone this repository (with the `wasm32-wasip1` Rust target installed,
-   `rustup target add wasm32-wasip1`).
+1. Clone this repository (with the `wasm32-wasip2` Rust target installed,
+   `rustup target add wasm32-wasip2`).
 
 2. Install the language server (native Rust toolchain required):
 
@@ -240,7 +240,7 @@ split in two:
 ```
 
 The two crates are deliberately independent: the root crate builds for
-`wasm32-wasip1`, while `lsp/` is a plain native binary (it has its own
+`wasm32-wasip2`, while `lsp/` is a plain native binary (it has its own
 `[workspace]` root). Run the server's tests with `cargo test` inside `lsp/`.
 
 ## License
