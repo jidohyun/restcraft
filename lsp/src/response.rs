@@ -223,7 +223,7 @@ pub fn show_response(
 ) -> Result<PathBuf, ShowError> {
     let path = response_file_path(request_name, mode, response.content_type.as_ref());
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::settings::create_private_dir(parent)?;
     }
     fs::write(&path, format_response(response, request_name, mode))?;
     open_in_zed(&path)?;

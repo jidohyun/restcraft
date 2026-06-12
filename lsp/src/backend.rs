@@ -307,7 +307,7 @@ impl Backend {
                 // command on disk so the action still produces something.
                 let path = std::env::temp_dir().join("restcraft").join("curl-command.txt");
                 if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    settings::create_private_dir(parent)?;
                 }
                 std::fs::write(&path, &command)?;
                 self.client
@@ -341,7 +341,7 @@ impl Backend {
         // (same philosophy as response.rs response files).
         let path = std::env::temp_dir().join("restcraft").join("history.http");
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            settings::create_private_dir(parent)?;
         }
         std::fs::write(&path, doc)?;
         match response::open_in_zed(&path) {

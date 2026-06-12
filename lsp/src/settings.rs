@@ -21,15 +21,19 @@ pub fn restcraft_home() -> PathBuf {
     dir
 }
 
-/// `create_dir_all` that makes newly created directories owner-only on unix.
-/// Pre-existing directories are left untouched.
+/// `create_dir_all` that makes the directory owner-only on unix. A
+/// pre-existing directory is re-tightened to 0700 too (same philosophy as
+/// the cookie jar re-tightening a legacy 0644 file on save) — response
+/// files, history.http, and curl-command.txt may all carry credentials.
 #[cfg(unix)]
 pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(dir)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(unix))]
