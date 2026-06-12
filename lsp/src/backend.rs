@@ -12,10 +12,14 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+use crate::completion::{self, RequestEntity, RequestVariableResolution, ResolvedValue};
 use crate::parser::{self, RequestBody};
 use crate::settings::{self, HttpSettings};
 use crate::state::ServerState;
-use crate::variables::{self, VariableContext};
+use crate::variables::request_vars::{
+    CachedExchange, CachedRequest, CachedResponse, RequestVariables, ResolveResult, ResolveWarning,
+};
+use crate::variables::{self, VariableContext, VariableError};
 use crate::{http, response};
 
 pub const COMMAND_SEND_REQUEST: &str = "restcraft.sendRequest";
@@ -91,7 +95,8 @@ impl Backend {
             document_dir: &document_dir,
         };
 
-        let substituted = variables::substitute(&block.text, &ctx);
+        let request_vars = self.request_variables_for(&uri, &document);
+        let substituted = variables::substitute_with(&block.text, &ctx, Some(&request_vars));
         if !substituted.errors.is_empty() {
             let list: Vec<String> = substituted
                 .errors
@@ -120,7 +125,7 @@ impl Backend {
             if process_variables {
                 let content = std::fs::read_to_string(path)
                     .with_context(|| format!("failed to read body file {}", path.display()))?;
-                let body = variables::substitute(&content, &ctx);
+                let body = variables::substitute_with(&content, &ctx, Some(&request_vars));
                 request.body = Some(RequestBody::Text(body.text));
             }
         }
@@ -182,6 +187,35 @@ impl Backend {
         }
 
         let http_response = result?;
+
+        // `# @name` exchanges feed request variable chaining: cache the
+        // request as actually sent plus the response (original
+        // RequestVariableCache.add — resending overwrites).
+        if let Some(name) = &block.metadata.name {
+            let exchange = CachedExchange {
+                request: CachedRequest {
+                    method: request.method.clone(),
+                    url: request.url.clone(),
+                    headers: request.headers.clone(),
+                    body: match &request.body {
+                        Some(RequestBody::Text(text)) => text.clone(),
+                        Some(RequestBody::File(path)) => {
+                            std::fs::read_to_string(path).unwrap_or_default()
+                        }
+                        None => String::new(),
+                    },
+                },
+                response: CachedResponse {
+                    status: http_response.status,
+                    status_text: http_response.status_text.clone(),
+                    headers: http_response.headers.clone(),
+                    body: String::from_utf8_lossy(&http_response.body).into_owned(),
+                },
+            };
+            self.state.insert_request_variable(&uri, name, exchange);
+            // "not been sent" hints referring to this name are stale now.
+            self.publish_variable_diagnostics(uri.clone()).await;
+        }
 
         if !block.metadata.no_cookie_jar {
             if let Err(e) = http::save_cookie_jar(&jar) {
@@ -283,8 +317,26 @@ impl Backend {
         names
     }
 
-    /// Warning diagnostics for every `{{ref}}` occurrence that does not
-    /// resolve with the current file variables + environment.
+    /// The declared `# @name`s + cached exchanges of one document — the view
+    /// substitution, diagnostics, completion and hover all share.
+    fn request_variables_for(
+        &self,
+        uri: &Url,
+        document: &parser::ParsedDocument,
+    ) -> RequestVariables {
+        let declared = document
+            .blocks
+            .iter()
+            .filter_map(|block| block.metadata.name.clone());
+        RequestVariables::new(declared, self.state.request_variables_snapshot(uri))
+    }
+
+    /// Diagnostics for every `{{ref}}` occurrence that does not resolve with
+    /// the current file variables + environment + request variable cache.
+    /// Hard failures (undefined variable, undeclared request name, bad
+    /// reference syntax) are warnings; soft request variable states (declared
+    /// but not sent yet, JSONPath miss, ...) are information, following the
+    /// original's ResolveError/ResolveWarning split.
     fn variable_diagnostics(&self, uri: &Url, text: &str) -> Vec<Diagnostic> {
         let document = parser::parse_document(text);
         let document_dir = document_dir(uri);
@@ -294,6 +346,7 @@ impl Backend {
             environment: &environment,
             document_dir: &document_dir,
         };
+        let request_vars = self.request_variables_for(uri, &document);
 
         let mut diagnostics = Vec::new();
         for (line_idx, line) in text.lines().enumerate() {
@@ -306,8 +359,15 @@ impl Backend {
             for (start, end) in reference_spans(line) {
                 // Re-running the substitution on just this occurrence reuses
                 // variables.rs's error reporting verbatim.
-                let result = variables::substitute(&line[start..end], &ctx);
+                let result =
+                    variables::substitute_with(&line[start..end], &ctx, Some(&request_vars));
                 for error in result.errors {
+                    let severity = match &error {
+                        VariableError::RequestVariableWarning { .. } => {
+                            DiagnosticSeverity::INFORMATION
+                        }
+                        _ => DiagnosticSeverity::WARNING,
+                    };
                     diagnostics.push(Diagnostic {
                         range: Range {
                             start: Position {
@@ -319,7 +379,7 @@ impl Backend {
                                 character: utf16_col(line, end),
                             },
                         },
-                        severity: Some(DiagnosticSeverity::WARNING),
+                        severity: Some(severity),
                         source: Some("restcraft".to_string()),
                         message: error.to_string(),
                         ..Default::default()
@@ -368,6 +428,11 @@ impl LanguageServer for Backend {
                     resolve_provider: Some(false),
                 }),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".into(), "{".into(), "$".into()]),
+                    ..Default::default()
+                }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec![
                         COMMAND_SEND_REQUEST.to_string(),
@@ -444,6 +509,54 @@ impl LanguageServer for Backend {
         self.client
             .publish_diagnostics(params.text_document.uri, Vec::new(), None)
             .await;
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(text) = self
+            .state
+            .documents
+            .get(&uri)
+            .map(|doc| doc.value().clone())
+        else {
+            return Ok(None);
+        };
+        // A missing/broken env file just narrows the variable items.
+        let environment = self.environment_for(&document_dir(&uri)).unwrap_or_default();
+        let document = parser::parse_document(&text);
+        let request_vars = self.request_variables_for(&uri, &document);
+        let items = completion::completion_items(
+            &text,
+            position,
+            &environment,
+            &CacheSource(&request_vars),
+        );
+        Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(text) = self
+            .state
+            .documents
+            .get(&uri)
+            .map(|doc| doc.value().clone())
+        else {
+            return Ok(None);
+        };
+        let document_dir = document_dir(&uri);
+        let environment = self.environment_for(&document_dir).unwrap_or_default();
+        let document = parser::parse_document(&text);
+        let request_vars = self.request_variables_for(&uri, &document);
+        Ok(crate::hover::hover(
+            &text,
+            position,
+            &environment,
+            &document_dir,
+            &CacheSource(&request_vars),
+        ))
     }
 
     /// One "Send Request" lens per request block (lens carries
@@ -603,6 +716,52 @@ impl LanguageServer for Backend {
         }
         Ok(None)
     }
+}
+
+/// Bridges the request variable cache (`variables::request_vars`) into the
+/// [`completion::RequestVariableSource`] seam completion.rs/hover.rs consume.
+struct CacheSource<'a>(&'a RequestVariables);
+
+impl completion::RequestVariableSource for CacheSource<'_> {
+    fn has(&self, name: &str) -> bool {
+        self.0.exchange(name).is_some()
+    }
+
+    fn headers(&self, name: &str, entity: RequestEntity) -> Option<Vec<(String, String)>> {
+        self.0.exchange(name).map(|exchange| match entity {
+            RequestEntity::Request => exchange.request.headers.clone(),
+            RequestEntity::Response => exchange.response.headers.clone(),
+        })
+    }
+
+    fn resolve(&self, path: &str) -> RequestVariableResolution {
+        match self.0.resolve(path) {
+            ResolveResult::Success(value) => {
+                RequestVariableResolution::Resolved(resolved_value(value))
+            }
+            ResolveResult::Warning {
+                warning: ResolveWarning::NotSent,
+                ..
+            } => RequestVariableResolution::NotSent,
+            ResolveResult::Warning { warning, .. } => {
+                RequestVariableResolution::Warning(warning.to_string())
+            }
+            ResolveResult::Error(error) => RequestVariableResolution::Warning(error.to_string()),
+        }
+    }
+}
+
+/// JSON container values hover as a fenced, pretty-printed block; everything
+/// else (strings, numbers, header values, body fragments) as plain text.
+fn resolved_value(value: String) -> ResolvedValue {
+    if value.starts_with(['{', '[']) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&value) {
+            if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+                return ResolvedValue::Json(pretty);
+            }
+        }
+    }
+    ResolvedValue::Text(value)
 }
 
 fn document_dir(uri: &Url) -> PathBuf {

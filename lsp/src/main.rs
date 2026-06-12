@@ -1,4 +1,6 @@
 mod backend;
+mod completion;
+mod hover;
 mod http;
 mod parser;
 mod response;

@@ -1,11 +1,18 @@
 //! Stage 2: `{{...}}` substitution on raw block text.
 //!
 //! Resolution order mirrors vscode-restclient `utils/variableProcessor.ts`:
-//! system -> request (TODO, Phase 2) -> file -> environment.
+//! system -> request -> file -> environment.
 //!
 //! Like the original, a reference that cannot be resolved is left in the
 //! output verbatim; the reasons are collected in `Substitution::errors` so
 //! the caller can surface diagnostics before/instead of sending.
+
+// Hosted here (not in main.rs) so this pass leaves main.rs untouched; the
+// path attribute keeps the file at src/request_vars.rs. Feel free to hoist
+// to `crate::request_vars` later (move this decl into main.rs, drop the
+// attribute, fix `crate::variables::request_vars` paths).
+#[path = "request_vars.rs"]
+pub mod request_vars;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +26,7 @@ use uuid::Uuid;
 
 use crate::parser::FileVariable;
 use crate::settings::SHARED_ENV_KEY;
+use request_vars::{RequestVariables, ResolveError, ResolveResult, ResolveWarning};
 
 #[derive(Debug, Error)]
 pub enum VariableError {
@@ -26,6 +34,22 @@ pub enum VariableError {
     Undefined(String),
     #[error("invalid system variable: {0}")]
     InvalidSystemVariable(String),
+    /// Request variable reference understood but not (yet) resolvable
+    /// (unsent request, missing path, ...) — original ResolveWarningMessage.
+    #[error("request variable `{reference}`: {warning}")]
+    RequestVariableWarning {
+        reference: String,
+        warning: ResolveWarning,
+    },
+    /// Request variable reference that can never resolve (bad syntax,
+    /// undeclared name) — original ResolveErrorMessage. The name mirrors the
+    /// RequestVariableWarning/-Error pair, hence the suffix overlap.
+    #[error("request variable `{reference}`: {error}")]
+    #[allow(clippy::enum_variant_names)]
+    RequestVariableError {
+        reference: String,
+        error: ResolveError,
+    },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -54,13 +78,32 @@ pub struct Substitution {
 ///
 /// vscode-restclient semantics: references are single-line (`.` in
 /// `/\{{2}(.+?)\}{2}/` does not cross newlines), provider order is
-/// system -> file -> environment, and unresolvable references stay verbatim.
-/// File/environment results are stable within one call (the original caches
-/// them); system variables resolve fresh per occurrence (two `{{$guid}}`
-/// differ).
+/// system -> request -> file -> environment, and unresolvable references
+/// stay verbatim. File/environment results are stable within one call (the
+/// original caches them); system variables resolve fresh per occurrence
+/// (two `{{$guid}}` differ).
+///
+/// Request variable chaining is disabled here; use [`substitute_with`] and
+/// pass the document's [`RequestVariables`] to enable it.
 pub fn substitute(text: &str, ctx: &VariableContext) -> Substitution {
+    substitute_with(text, ctx, None)
+}
+
+/// [`substitute`] with request variable chaining: `{{name.response.body...}}`
+/// references resolve against `request_variables` (declared `# @name`s +
+/// cached exchanges for the current document).
+///
+/// The cache rides as a separate argument instead of a `VariableContext`
+/// field so the existing literal constructions in backend.rs keep compiling
+/// until the integrator wires the cache through.
+pub fn substitute_with<'a>(
+    text: &str,
+    ctx: &'a VariableContext<'a>,
+    request_variables: Option<&'a RequestVariables>,
+) -> Substitution {
     let mut resolver = Resolver {
         ctx,
+        request_variables,
         file_values: file_value_map(ctx.file_variables),
         memo: HashMap::new(),
         visiting: Vec::new(),
@@ -103,11 +146,11 @@ pub fn resolve_system_variable(
     }
 }
 
-// TODO(Phase 2): request variable chaining — {{name.response.body.$.json.path}}
-// (vscode-restclient utils/requestVariableCache.ts + requestVariableProvider.ts)
-
 struct Resolver<'a> {
     ctx: &'a VariableContext<'a>,
+    /// `# @name` request variables of the current document; `None` disables
+    /// request variable chaining (plain `substitute`).
+    request_variables: Option<&'a RequestVariables>,
     /// name -> escape-processed raw value; last definition wins, like the
     /// original `FileVariableProvider` document scan.
     file_values: HashMap<String, String>,
@@ -137,7 +180,31 @@ impl Resolver<'_> {
             }
         }
 
-        // TODO(Phase 2): request variables resolve here, before file variables.
+        // Request variables resolve right after system ones. A declared
+        // `# @name` claims the reference even when resolution fails — the
+        // original processRawRequest `break`s out of the provider chain on
+        // warning/error, so file/environment variables never shadow it.
+        if let Some(vars) = self.request_variables {
+            if vars.is_request_variable(name) {
+                return match vars.resolve(name) {
+                    ResolveResult::Success(value) => Some(value),
+                    ResolveResult::Warning { warning, .. } => {
+                        self.errors.push(VariableError::RequestVariableWarning {
+                            reference: name.to_string(),
+                            warning,
+                        });
+                        None
+                    }
+                    ResolveResult::Error(error) => {
+                        self.errors.push(VariableError::RequestVariableError {
+                            reference: name.to_string(),
+                            error,
+                        });
+                        None
+                    }
+                };
+            }
+        }
 
         // `{{%name}}` URL-encodes a *file* variable (original FileVariableProvider).
         let (file_name, url_encode) = match name.strip_prefix('%') {
@@ -940,6 +1007,94 @@ mod tests {
         // out of MVP scope -> not a system variable -> ends up Undefined
         assert!(resolve_system_variable("$aadToken", &c).is_none());
         assert!(matches!(resolve_system_variable("$guid", &c), Some(Ok(_))));
+    }
+
+    fn request_vars_fixture() -> RequestVariables {
+        use request_vars::{CachedExchange, CachedRequest, CachedResponse};
+        use std::sync::Arc;
+        let exchange = CachedExchange {
+            request: CachedRequest {
+                method: "POST".into(),
+                url: "https://example.com/login".into(),
+                headers: vec![("Content-Type".into(), "application/json".into())],
+                body: r#"{"user":"jido"}"#.into(),
+            },
+            response: CachedResponse {
+                status: 200,
+                status_text: "OK".into(),
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: r#"{"token":"abc"}"#.into(),
+            },
+        };
+        RequestVariables::new(
+            ["login".to_string(), "unsent".to_string()],
+            std::iter::once(("login".to_string(), Arc::new(exchange))).collect(),
+        )
+    }
+
+    #[test]
+    fn request_variable_resolves_in_substitution() {
+        let environment = env(&[]);
+        let c = ctx(&[], &environment, Path::new("."));
+        let vars = request_vars_fixture();
+        let s = substitute_with(
+            "Authorization: Bearer {{login.response.body.$.token}}",
+            &c,
+            Some(&vars),
+        );
+        assert!(s.errors.is_empty(), "{:?}", s.errors);
+        assert_eq!(s.text, "Authorization: Bearer abc");
+    }
+
+    #[test]
+    fn request_variable_shadows_file_variable_even_on_failure() {
+        // Original provider order is system -> request -> file -> environment
+        // and a request-variable hit breaks the chain on warning/error.
+        let file_vars = [fv("login", "file-value")];
+        let environment = env(&[("unsent", "env-value")]);
+        let c = ctx(&file_vars, &environment, Path::new("."));
+        let vars = request_vars_fixture();
+
+        // Sent request variable wins over the same-named file variable...
+        let s = substitute_with("{{login.response.body.$.token}}", &c, Some(&vars));
+        assert_eq!(s.text, "abc");
+
+        // ...and an unsent one leaves the reference verbatim with a warning
+        // instead of falling through to the environment.
+        let s = substitute_with("{{unsent.response.body.*}}", &c, Some(&vars));
+        assert_eq!(s.text, "{{unsent.response.body.*}}");
+        assert!(matches!(
+            s.errors.as_slice(),
+            [VariableError::RequestVariableWarning {
+                warning: request_vars::ResolveWarning::NotSent,
+                ..
+            }]
+        ));
+
+        // A bare declared name is also claimed (MissingRequestEntityName),
+        // shadowing the file variable.
+        let s = substitute_with("{{login}}", &c, Some(&vars));
+        assert_eq!(s.text, "{{login}}");
+        assert!(matches!(
+            s.errors.as_slice(),
+            [VariableError::RequestVariableWarning {
+                warning: request_vars::ResolveWarning::MissingRequestEntityName,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn undeclared_dotted_reference_falls_through_chain() {
+        let environment = env(&[]);
+        let c = ctx(&[], &environment, Path::new("."));
+        let vars = request_vars_fixture();
+        let s = substitute_with("{{nope.response.body.*}}", &c, Some(&vars));
+        assert_eq!(s.text, "{{nope.response.body.*}}");
+        assert!(matches!(
+            s.errors.as_slice(),
+            [VariableError::Undefined(name)] if name == "nope.response.body.*"
+        ));
     }
 
     #[test]

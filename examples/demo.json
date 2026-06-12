@@ -1,0 +1,5 @@
+{
+  "hello": "world",
+  "nested": { "id": 7 },
+  "items": [{ "name": "a" }, { "name": "b" }]
+}
