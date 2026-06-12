@@ -10,3 +10,6 @@ X-Requested-At: {{$datetime iso8601}}
 ### 요청 변수 체이닝: echo를 먼저 보내면 응답 값이 헤더로 들어간다
 GET {{base}}/demo.json
 X-From-Previous: {{echo.response.body.$.hello}}
+
+### curl import: 같은 요청을 curl 명령 그대로 붙여넣어도 전송된다
+curl -X GET {{base}}/demo.json -H 'X-Imported-From: curl'

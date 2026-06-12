@@ -1,5 +1,8 @@
 mod backend;
+mod clipboard;
 mod completion;
+mod curl;
+mod history;
 mod hover;
 mod http;
 mod parser;

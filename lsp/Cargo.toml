@@ -21,6 +21,8 @@ serde_json_path = "0.7"
 sxd-document = "0.3"
 sxd-xpath = "0.4"
 uuid = { version = "1", features = ["v4"] }
+# Digest auth challenge responses (http::digest): MD5 + MD5-sess.
+md-5 = "0.10"
 rand = "0.9"
 chrono = "0.4"
 dirs = "6"
@@ -30,6 +32,8 @@ anyhow = "1"
 base64 = "0.22"
 percent-encoding = "2"
 mime = "0.3"
+# curl import (curl.rs): POSIX-style tokenization of pasted curl commands.
+shell-words = "1"
 
 # Standalone crate on purpose: the repository root is a WASM extension crate
 # and must not pull this native binary into its build graph.

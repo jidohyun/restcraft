@@ -20,10 +20,13 @@ use crate::variables::request_vars::{
     CachedExchange, CachedRequest, CachedResponse, RequestVariables, ResolveResult, ResolveWarning,
 };
 use crate::variables::{self, VariableContext, VariableError};
-use crate::{http, response};
+use crate::{clipboard, curl, history, http, response};
 
 pub const COMMAND_SEND_REQUEST: &str = "restcraft.sendRequest";
 pub const COMMAND_SWITCH_ENVIRONMENT: &str = "restcraft.switchEnvironment";
+pub const COMMAND_COPY_AS_CURL: &str = "restcraft.copyAsCurl";
+pub const COMMAND_VIEW_HISTORY: &str = "restcraft.viewRequestHistory";
+pub const COMMAND_CLEAR_HISTORY: &str = "restcraft.clearRequestHistory";
 
 /// Picker/lens label for the unselected (`$shared` only) environment, same
 /// wording as vscode-restclient.
@@ -111,7 +114,7 @@ impl Backend {
                 .await;
         }
 
-        let mut request = parser::parse_request(&substituted.text, &document_dir)?;
+        let mut request = parse_block_request(&substituted.text, &document_dir)?;
 
         // `<@ path` external bodies: the file content goes through variable
         // substitution too (detected on the block text, applied to the
@@ -228,6 +231,28 @@ impl Backend {
             }
         }
 
+        // History records the final request — post-substitution, exactly as
+        // sent (original requestController.ts records after the response).
+        // Failures are non-fatal, like the cookie jar above.
+        let body_text = match &request.body {
+            Some(RequestBody::Text(text)) => Some(text.clone()),
+            Some(RequestBody::File(path)) => std::fs::read_to_string(path).ok(),
+            None => None,
+        };
+        if let Err(e) = history::record(history::HistoricalRequest::new(
+            request.method.clone(),
+            request.url.clone(),
+            request.headers.clone(),
+            body_text,
+        )) {
+            self.client
+                .show_message(
+                    MessageType::WARNING,
+                    format!("failed to record request history: {e:#}"),
+                )
+                .await;
+        }
+
         match response::show_response(&http_response, &request_name, response::DisplayMode::Full) {
             Ok(_path) => Ok(()),
             // The response file exists; only the tab-open failed. Tell the
@@ -238,6 +263,128 @@ impl Backend {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// "Copy Request As cURL": substitutes and parses the block at `line`
+    /// (curl blocks included, via the same parser factory as sending), renders
+    /// it with curl::to_curl and copies it to the OS clipboard. A clipboard
+    /// failure falls back to writing the command into a file and pointing the
+    /// user at it.
+    async fn copy_as_curl(&self, uri: Url, line: u32) -> anyhow::Result<()> {
+        let text = self
+            .state
+            .documents
+            .get(&uri)
+            .map(|doc| doc.value().clone())
+            .ok_or_else(|| anyhow!("document not open: {uri}"))?;
+        let document = parser::parse_document(&text);
+        let block = parser::block_at_line(&document, line)
+            .ok_or_else(|| anyhow!("no request block at line {}", line + 1))?;
+
+        let document_dir = document_dir(&uri);
+        // A missing/broken env file degrades to fewer substitutions, like
+        // completion/hover — copying must not hard-fail on it.
+        let environment = self.environment_for(&document_dir).unwrap_or_default();
+        let ctx = VariableContext {
+            file_variables: &document.file_variables,
+            environment: &environment,
+            document_dir: &document_dir,
+        };
+        let request_vars = self.request_variables_for(&uri, &document);
+        let substituted = variables::substitute_with(&block.text, &ctx, Some(&request_vars));
+
+        let request = parse_block_request(&substituted.text, &document_dir)?;
+        let command = curl::to_curl(&request);
+
+        match clipboard::copy_to_clipboard(&command) {
+            Ok(()) => {
+                self.client
+                    .show_message(MessageType::INFO, "Copied request as cURL")
+                    .await;
+            }
+            Err(e) => {
+                // Clipboard helpers can be missing (headless/SSH): leave the
+                // command on disk so the action still produces something.
+                let path = std::env::temp_dir().join("restcraft").join("curl-command.txt");
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, &command)?;
+                self.client
+                    .show_message(
+                        MessageType::WARNING,
+                        format!(
+                            "clipboard copy failed ({e:#}) — command saved at {}",
+                            path.display()
+                        ),
+                    )
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// "View Request History": renders ~/.restcraft/history.json as a plain
+    /// .http document at a stable temp path and opens it in Zed. Being a
+    /// regular .http buffer, each entry gets the usual "Send Request" code
+    /// lens — our replacement for the original's QuickPick.
+    async fn view_request_history(&self) -> anyhow::Result<()> {
+        if history::load().is_empty() {
+            // Original historyController wording.
+            self.client
+                .show_message(MessageType::INFO, "No request history items are found!")
+                .await;
+            return Ok(());
+        }
+        let doc = history::render_history_http();
+        // Stable path: re-viewing refreshes the already-open tab in place
+        // (same philosophy as response.rs response files).
+        let path = std::env::temp_dir().join("restcraft").join("history.http");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, doc)?;
+        match response::open_in_zed(&path) {
+            Ok(()) => Ok(()),
+            // The file exists; only the tab-open failed (same handling as
+            // show_response).
+            Err(e @ response::ShowError::ZedCliMissing(_)) => {
+                self.client.show_message(MessageType::WARNING, e.to_string()).await;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// "Clear Request History": showMessageRequest confirmation (original
+    /// warning wording), then truncates history.json to `[]`.
+    async fn clear_request_history(&self) -> anyhow::Result<()> {
+        let actions = vec![
+            MessageActionItem {
+                title: "Yes".to_string(),
+                properties: Default::default(),
+            },
+            MessageActionItem {
+                title: "No".to_string(),
+                properties: Default::default(),
+            },
+        ];
+        let choice = self
+            .client
+            .show_message_request(
+                MessageType::WARNING,
+                "Do you really want to clear request history?",
+                Some(actions),
+            )
+            .await
+            .map_err(|e| anyhow!("history confirmation prompt failed: {e}"))?;
+        if choice.is_some_and(|item| item.title == "Yes") {
+            history::clear()?;
+            self.client
+                .show_message(MessageType::INFO, "Request history has been cleared")
+                .await;
+        }
+        Ok(())
     }
 
     /// Persists the selection (settings::save_current_environment) and updates
@@ -437,6 +584,9 @@ impl LanguageServer for Backend {
                     commands: vec![
                         COMMAND_SEND_REQUEST.to_string(),
                         COMMAND_SWITCH_ENVIRONMENT.to_string(),
+                        COMMAND_COPY_AS_CURL.to_string(),
+                        COMMAND_VIEW_HISTORY.to_string(),
+                        COMMAND_CLEAR_HISTORY.to_string(),
                     ],
                     work_done_progress_options: Default::default(),
                 }),
@@ -630,6 +780,35 @@ impl LanguageServer for Backend {
                 }),
                 ..Default::default()
             }));
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: "Copy Request As cURL".to_string(),
+                kind: Some(CodeActionKind::EMPTY),
+                command: Some(Command {
+                    title: "Copy Request As cURL".to_string(),
+                    command: COMMAND_COPY_AS_CURL.to_string(),
+                    arguments: Some(vec![json!(uri), json!(block.lens_line)]),
+                }),
+                ..Default::default()
+            }));
+        }
+
+        // History actions are block-independent — the original exposes them
+        // in the command palette from anywhere; any cursor position in a
+        // .http document is our equivalent surface.
+        for (title, command) in [
+            ("View Request History", COMMAND_VIEW_HISTORY),
+            ("Clear Request History", COMMAND_CLEAR_HISTORY),
+        ] {
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.to_string(),
+                kind: Some(CodeActionKind::EMPTY),
+                command: Some(Command {
+                    title: title.to_string(),
+                    command: command.to_string(),
+                    arguments: None,
+                }),
+                ..Default::default()
+            }));
         }
 
         let document_dir = document_dir(&uri);
@@ -710,6 +889,60 @@ impl LanguageServer for Backend {
                     }
                 });
             }
+            COMMAND_COPY_AS_CURL => {
+                let mut args = params.arguments.into_iter();
+                let uri = args
+                    .next()
+                    .and_then(|v| serde_json::from_value::<Url>(v).ok());
+                let line = args.next().and_then(|v| v.as_u64()).map(|l| l as u32);
+                let (Some(uri), Some(line)) = (uri, line) else {
+                    self.client
+                        .show_message(
+                            MessageType::ERROR,
+                            format!("{COMMAND_COPY_AS_CURL}: expected [uri, line] arguments"),
+                        )
+                        .await;
+                    return Ok(None);
+                };
+                let this = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = this.copy_as_curl(uri, line).await {
+                        this.client
+                            .show_message(
+                                MessageType::ERROR,
+                                format!("Copy Request As cURL failed: {e:#}"),
+                            )
+                            .await;
+                    }
+                });
+            }
+            COMMAND_VIEW_HISTORY => {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = this.view_request_history().await {
+                        this.client
+                            .show_message(
+                                MessageType::ERROR,
+                                format!("View Request History failed: {e:#}"),
+                            )
+                            .await;
+                    }
+                });
+            }
+            COMMAND_CLEAR_HISTORY => {
+                // Spawned: the confirmation round-trips through the client.
+                let this = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = this.clear_request_history().await {
+                        this.client
+                            .show_message(
+                                MessageType::ERROR,
+                                format!("Clear Request History failed: {e:#}"),
+                            )
+                            .await;
+                    }
+                });
+            }
             other => {
                 self.client
                     .show_message(MessageType::ERROR, format!("unknown command: {other}"))
@@ -764,6 +997,21 @@ fn resolved_value(value: String) -> ResolvedValue {
         }
     }
     ResolvedValue::Text(value)
+}
+
+/// RequestParserFactory equivalent: a (substituted) block whose text is a
+/// curl command parses through curl::parse_curl, everything else through the
+/// regular .http parser. Send and copy-as-curl share this branch, so curl
+/// blocks behave like native blocks everywhere downstream.
+fn parse_block_request(
+    text: &str,
+    base_dir: &Path,
+) -> anyhow::Result<parser::ParsedRequest> {
+    if curl::is_curl(text) {
+        Ok(curl::parse_curl(text, base_dir)?)
+    } else {
+        Ok(parser::parse_request(text, base_dir)?)
+    }
 }
 
 fn document_dir(uri: &Url) -> PathBuf {

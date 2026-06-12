@@ -19,6 +19,12 @@ use thiserror::Error;
 use crate::parser::{ParsedRequest, RequestBody, RequestMetadata};
 use crate::settings::HttpSettings;
 
+// Hosted as a child of `http` so main.rs stays untouched (same pattern as
+// `variables::request_vars`); the path attribute keeps the file at
+// src/digest.rs. Digest auth is part of the HTTP execution layer anyway.
+#[path = "digest.rs"]
+pub mod digest;
+
 const DEFAULT_USER_AGENT: &str = "restcraft";
 
 #[derive(Debug, Error)]
@@ -292,7 +298,18 @@ pub async fn execute(
     }
     let client = builder.build()?;
 
-    let headers = build_header_map(request)?;
+    let mut headers = build_header_map(request)?;
+
+    // `Authorization: Digest <user> <pass>` carries credentials, not a wire
+    // header (httpClient.ts removes it and registers the digest hook): strip
+    // it here and answer the 401 challenge after the first send.
+    let digest_creds = headers
+        .get(reqwest::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(digest::parse_credentials);
+    if digest_creds.is_some() {
+        headers.remove(reqwest::header::AUTHORIZATION);
+    }
 
     let mut body_bytes = resolve_body_bytes(request)?;
     if request.is_graphql() {
@@ -303,13 +320,44 @@ pub async fn execute(
         body_bytes = Some(build_graphql_body(&text)?.into_bytes());
     }
 
-    let mut req = client.request(method, url).headers(headers);
+    // The digest retry resends the original request, so keep a copy of the
+    // body only when digest credentials are armed.
+    let retry_body = digest_creds.as_ref().and_then(|_| body_bytes.clone());
+
+    let mut req = client
+        .request(method.clone(), url.clone())
+        .headers(headers.clone());
     if let Some(bytes) = body_bytes {
         req = req.body(bytes);
     }
 
     let start = Instant::now();
-    let response = req.send().await?;
+    let mut response = req.send().await?;
+
+    // 401 + `WWW-Authenticate: Digest ...` → compute the digest Authorization
+    // header and retry exactly once (the got afterResponse hook in digest.ts).
+    if let Some(creds) = digest_creds {
+        let auth = digest::answer_challenge(
+            &creds,
+            &request.method,
+            response.status().as_u16(),
+            response
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            response.url(),
+        );
+        if let Some(auth) = auth {
+            let mut retry = client
+                .request(method, url)
+                .headers(headers)
+                .header(reqwest::header::AUTHORIZATION, auth);
+            if let Some(bytes) = retry_body {
+                retry = retry.body(bytes);
+            }
+            response = retry.send().await?;
+        }
+    }
 
     let status = response.status();
     let version = format!("{:?}", response.version()); // Debug prints "HTTP/1.1"
