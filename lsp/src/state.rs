@@ -25,8 +25,12 @@ pub struct ServerState {
     cookie_jar: Mutex<Option<Arc<CookieStoreMutex>>>,
     /// Request variable cache: document URI -> `# @name` -> last sent
     /// exchange. Document-scoped like the original `RequestVariableCache`;
-    /// resending under the same name overwrites. Never evicted on
-    /// didChange/didClose — the original keeps responses across edits too.
+    /// resending under the same name overwrites. Kept across didChange (the
+    /// original keeps responses across edits too) but evicted on didClose —
+    /// references are document-scoped, so a closed document's cache can only
+    /// ever serve that document again, and holding full bodies for the
+    /// process lifetime would leak. (Divergence from upstream, which never
+    /// evicts: reopening a file requires resending its named requests.)
     request_variables: DashMap<Url, HashMap<String, Arc<CachedExchange>>>,
 }
 
@@ -75,6 +79,11 @@ impl ServerState {
             .get(document)
             .map(|names| names.clone())
             .unwrap_or_default()
+    }
+
+    /// Drops every cached exchange for `document` — call on didClose.
+    pub fn evict_request_variables(&self, document: &Url) {
+        self.request_variables.remove(document);
     }
 
     /// The shared cookie jar, loaded from disk on first use. A jar that fails
@@ -152,5 +161,19 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert!(Arc::ptr_eq(snapshot.get("login").unwrap(), &cached));
         assert!(state.request_variables_snapshot(&doc_b).is_empty());
+    }
+
+    #[test]
+    fn evict_drops_only_the_closed_document() {
+        let state = ServerState::new();
+        let doc_a: Url = "file:///a.http".parse().unwrap();
+        let doc_b: Url = "file:///b.http".parse().unwrap();
+        state.insert_request_variable(&doc_a, "login", exchange("a"));
+        state.insert_request_variable(&doc_b, "login", exchange("b"));
+
+        state.evict_request_variables(&doc_a);
+
+        assert!(state.get_request_variable(&doc_a, "login").is_none());
+        assert!(state.get_request_variable(&doc_b, "login").is_some());
     }
 }

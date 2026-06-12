@@ -505,6 +505,8 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.state.documents.remove(&params.text_document.uri);
+        self.state
+            .evict_request_variables(&params.text_document.uri);
         // Clear our diagnostics for the closed buffer.
         self.client
             .publish_diagnostics(params.text_document.uri, Vec::new(), None)
