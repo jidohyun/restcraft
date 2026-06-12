@@ -1,0 +1,75 @@
+# Release: triggered by pushing a tag matching v* (e.g. v0.1.0).
+#
+# Flow (two stages):
+#   1. create-release — taiki-e/create-gh-release-action creates the GitHub
+#      Release for the pushed tag. upload-rust-binary-action does NOT create
+#      releases itself, so this job must run first.
+#   2. upload-assets — one matrix job per target builds lsp/ (restcraft-lsp)
+#      and uploads the archive + sha256 checksum to that release.
+#
+# Asset name contract (consumed by the Zed extension's binary downloader):
+#   - unix:    restcraft-lsp-{target}.tar.gz   (tar: unix  → .tar.gz)
+#   - windows: restcraft-lsp-{target}.zip      (zip: windows → .zip)
+#   - archive contains a single binary: restcraft-lsp (restcraft-lsp.exe on windows)
+#   - checksum: {archive}.sha256 uploaded alongside each archive
+#
+# Cross-compilation: upload-rust-binary-action auto-selects `cross` when
+# host != target (both linux musl targets on ubuntu-latest), and runs
+# `rustup target add` itself for native cargo builds (x86_64-apple-darwin
+# on the arm64 macos-latest runner).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    name: upload (${{ matrix.target }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: restcraft-lsp
+          target: ${{ matrix.target }}
+          manifest-path: lsp/Cargo.toml
+          # Explicit even though these are the action defaults — they encode
+          # the asset name contract above.
+          archive: "$bin-$target"
+          tar: unix
+          zip: windows
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

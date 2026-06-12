@@ -3,6 +3,8 @@ name = "restcraft-lsp"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Language server backing the RestCraft REST client extension for Zed"
+repository = "https://github.com/jidohyun/restcraft"
 publish = false
 
 [[bin]]

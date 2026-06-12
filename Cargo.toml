@@ -3,6 +3,8 @@ name = "restcraft"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "REST Client extension for Zed — send HTTP requests directly from .http files"
+repository = "https://github.com/jidohyun/restcraft"
 publish = false
 
 [lib]

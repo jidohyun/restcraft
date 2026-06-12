@@ -1,0 +1,59 @@
+# CI: runs on every push to main and on every pull request.
+#
+# Two independent jobs:
+#   - lsp:  native LSP server crate (lsp/) — cargo test + clippy (deny warnings)
+#   - wasm: root Zed extension crate — cargo check against wasm32-wasip2
+#
+# The two crates are intentionally separate cargo workspaces (lsp/Cargo.toml
+# declares an empty [workspace]), so each job caches/builds its own root.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lsp:
+    name: lsp (test + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (stable)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lsp
+
+      - name: cargo test
+        working-directory: lsp
+        run: cargo test
+
+      - name: cargo clippy
+        working-directory: lsp
+        run: cargo clippy --all-targets -- -D warnings
+
+  wasm:
+    name: extension (wasm32-wasip2 check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (stable + wasm32-wasip2)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check (Zed extension, WASM)
+        run: cargo check --target wasm32-wasip2
