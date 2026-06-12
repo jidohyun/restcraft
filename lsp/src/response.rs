@@ -15,7 +15,9 @@ const MAX_FILE_NAME_CHARS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
-    /// Status line + headers + formatted body, written as `.txt`.
+    /// Status line + headers + formatted body, written as `.http-response`
+    /// (a dedicated language so Zed can highlight the status line/headers and
+    /// inject JSON/XML/HTML into the body).
     Full,
     /// Body only, extension derived from the response MIME type
     /// (`.json`, `.xml`, `.html`, ...; fallback `.txt`).
@@ -43,7 +45,7 @@ pub fn response_file_path(
     content_type: Option<&mime::Mime>,
 ) -> PathBuf {
     let ext = match mode {
-        DisplayMode::Full => "txt",
+        DisplayMode::Full => "http-response",
         DisplayMode::BodyOnly => extension_for_mime(content_type),
     };
     std::env::temp_dir()
@@ -151,6 +153,52 @@ fn format_body_text(body: &str, content_type: Option<&mime::Mime>) -> String {
     }
 }
 
+/// Well-known response headers whose canonical casing is not plain
+/// `Title-Case` per dash-separated token.
+const SPECIAL_HEADER_CASING: &[&str] = &[
+    "ETag",
+    "WWW-Authenticate",
+    "Content-MD5",
+    "X-XSS-Protection",
+    "X-DNS-Prefetch-Control",
+];
+
+/// Display casing for a response header name.
+///
+/// vscode-restclient shows the *original wire casing*: Node's http module
+/// lowercases response header names, and `HttpClient.normalizeHeaderNames`
+/// (src/utils/httpClient.ts) restores the as-sent casing from
+/// `response.rawHeaders` before display. reqwest/hyper also lowercase header
+/// names but expose no rawHeaders equivalent, so an exact port is impossible
+/// from this layer. We render canonical `Title-Case` (plus a small
+/// special-case list) instead, which equals the wire casing well-behaved
+/// servers send — i.e. matches vscode-restclient's display in the common
+/// case. Known difference: servers sending non-canonical casing (e.g.
+/// `CF-Ray`) show up canonicalized here (`Cf-Ray`) but as-sent in
+/// vscode-restclient.
+fn display_header_name(name: &str) -> String {
+    if let Some(special) = SPECIAL_HEADER_CASING
+        .iter()
+        .find(|s| s.eq_ignore_ascii_case(name))
+    {
+        return (*special).to_string();
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut upper_next = true;
+    for c in name.chars() {
+        if c == '-' {
+            out.push('-');
+            upper_next = true;
+        } else if upper_next {
+            out.push(c.to_ascii_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn format_size(bytes: usize) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
@@ -164,10 +212,13 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
-/// Renders the response document. `Full` is the exchange view:
-/// `# name | elapsed | size` meta comment, status line, headers, blank line,
-/// formatted body. `BodyOnly` is just the (formatted) body — binary MIME
-/// types pass through as raw bytes.
+/// Renders the response document. `Full` is the exchange view in HTTP wire
+/// shape (the contract the `.http-response` tree-sitter grammar parses):
+/// `# name | elapsed | size` meta comment, blank line,
+/// `HTTP/<ver> <code> <reason>` status line (reason omitted — no trailing
+/// space — when unknown), `Name: value` header lines, blank line, formatted
+/// body. `BodyOnly` is just the (formatted) body — binary MIME types pass
+/// through as raw bytes.
 pub fn format_response(
     response: &HttpResponse,
     request_name: &str,
@@ -191,12 +242,18 @@ pub fn format_response(
                 response.elapsed.as_millis(),
                 format_size(response.body.len()),
             ));
-            out.push_str(&format!(
-                "{} {} {}\n",
-                response.version, response.status, response.status_text
-            ));
+            if response.status_text.is_empty() {
+                // No trailing space for unknown reason phrases — keeps the
+                // line grammar-friendly and matches common tool output.
+                out.push_str(&format!("{} {}\n", response.version, response.status));
+            } else {
+                out.push_str(&format!(
+                    "{} {} {}\n",
+                    response.version, response.status, response.status_text
+                ));
+            }
             for (name, value) in &response.headers {
-                out.push_str(&format!("{name}: {value}\n"));
+                out.push_str(&format!("{}: {value}\n", display_header_name(name)));
             }
             out.push('\n');
             if binary {
@@ -332,7 +389,8 @@ mod tests {
     #[test]
     fn file_path_is_stable_and_extension_follows_mode() {
         let full = response_file_path("demo", DisplayMode::Full, Some(&mime("application/json")));
-        assert!(full.ends_with(Path::new("restcraft/demo.txt")));
+        // exchange view gets the dedicated language extension regardless of MIME
+        assert!(full.ends_with(Path::new("restcraft/demo.http-response")));
 
         let body = response_file_path("demo", DisplayMode::BodyOnly, Some(&mime("application/json")));
         assert!(body.ends_with(Path::new("restcraft/demo.json")));
@@ -353,11 +411,62 @@ mod tests {
 
         assert!(text.starts_with("# demo | 123ms | 17B\n"));
         assert!(text.contains("HTTP/1.1 200 OK\n"));
-        assert!(text.contains("content-type: application/json\n"));
+        // lowercase reqwest names are canonicalized for display
+        assert!(text.contains("Content-Type: application/json\n"));
         // duplicate headers preserved as separate lines
-        assert!(text.contains("x-custom: a\n"));
-        assert!(text.contains("x-custom: b\n"));
+        assert!(text.contains("X-Custom: a\n"));
+        assert!(text.contains("X-Custom: b\n"));
         assert!(text.contains("{\n  \"a\": 1,"));
+    }
+
+    /// Exact layout contract shared with the `.http-response` tree-sitter
+    /// grammar: meta comment, blank line, status line, headers, blank line,
+    /// body. Breaking this breaks highlighting/injection.
+    #[test]
+    fn full_mode_exact_wire_layout() {
+        let r = HttpResponse {
+            status: 200,
+            status_text: "OK".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: br#"{"a":1}"#.to_vec(),
+            content_type: Some(mime("application/json")),
+            elapsed: Duration::from_millis(12),
+        };
+        let text = String::from_utf8(format_response(&r, "demo", DisplayMode::Full)).unwrap();
+        assert_eq!(
+            text,
+            "# demo | 12ms | 7B\n\
+             \n\
+             HTTP/1.1 200 OK\n\
+             Content-Type: application/json\n\
+             \n\
+             {\n  \"a\": 1\n}"
+        );
+    }
+
+    #[test]
+    fn status_line_without_reason_has_no_trailing_space() {
+        let mut r = response(Some("application/json"), b"{}");
+        r.status = 599;
+        r.status_text = String::new();
+        let text = String::from_utf8(format_response(&r, "demo", DisplayMode::Full)).unwrap();
+        assert!(text.contains("HTTP/1.1 599\n"));
+        assert!(!text.contains("HTTP/1.1 599 \n"));
+    }
+
+    #[test]
+    fn header_names_canonicalized_for_display() {
+        assert_eq!(display_header_name("content-type"), "Content-Type");
+        assert_eq!(display_header_name("x-request-id"), "X-Request-Id");
+        assert_eq!(display_header_name("etag"), "ETag");
+        assert_eq!(display_header_name("www-authenticate"), "WWW-Authenticate");
+        assert_eq!(display_header_name("date"), "Date");
+        // already-canonical input passes through
+        assert_eq!(display_header_name("Content-Type"), "Content-Type");
+        // documented difference vs vscode-restclient (which would keep the
+        // server's original `CF-Ray` via Node rawHeaders)
+        assert_eq!(display_header_name("cf-ray"), "Cf-Ray");
     }
 
     #[test]

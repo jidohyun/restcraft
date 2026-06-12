@@ -1,0 +1,6 @@
+name = "HTTP Response"
+grammar = "http_response"
+path_suffixes = ["http-response"]
+# The RestCraft exchange view starts with a `# <name> | <elapsed> | <size>`
+# meta line; only leading lines are comments in the grammar.
+line_comments = ["# "]

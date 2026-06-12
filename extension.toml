@@ -13,3 +13,7 @@ languages = ["HTTP"]
 [grammars.http]
 repository = "https://github.com/rest-nvim/tree-sitter-http"
 rev = "db8b4398de90b6d0b6c780aba96aaa2cd8e9202c"
+
+[grammars.http_response]
+repository = "file:///Users/dnp-jidohyun/Developer/tree-sitter-http-response"
+rev = "a4fde915b0c4adaff17b9dfe7e21b58d58a99e95"
