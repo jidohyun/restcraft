@@ -32,7 +32,7 @@ The two crates are deliberately independent: the root crate builds for
 ## The "HTTP Response" language
 
 Responses open as `.http-response` files in a dedicated language backed by
-[tree-sitter-http-response](https://github.com/dnp-jidohyun/tree-sitter-http-response),
+[tree-sitter-http-response](https://github.com/dnp-dohyun/tree-sitter-http-response),
 so the exchange view is highlighted instead of plain text:
 
 ```
